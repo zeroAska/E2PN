@@ -18,6 +18,11 @@ exp_args.add_argument('-s', '--seed', type=int, default=2913,
                       help='random seed')
 exp_args.add_argument('--run-mode', type=str, default='train',
                       help='train | eval | test')
+exp_args.add_argument('--crop-ratio', type=float, default=0.0, help='ratio of random input data cropping')
+exp_args.add_argument('--modelnet-airplane-only', action='store_true', help='use only the unsymmetric plane category in the modelnet dataset')
+exp_args.add_argument('--modelnet-half-categories', action='store_true', help='use only the unsymmetric plane category in the modelnet dataset')
+exp_args.add_argument('--max-rotation-degree', type=float, default=90.0)
+
 
 ######### Network arguments
 net_args = parser.add_parser("model")

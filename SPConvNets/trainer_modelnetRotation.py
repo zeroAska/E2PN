@@ -3,6 +3,7 @@ from telnetlib import NEW_ENVIRON
 from SPConvNets import Dataloader_ModelNet40, Dataloader_ModelNet40Alignment
 from tqdm import tqdm
 import torch
+import pypose as pp
 import vgtk
 import vgtk.pc as pctk
 import numpy as np
@@ -10,8 +11,10 @@ import os
 import torch.nn.functional as F
 from sklearn.neighbors import KDTree
 import vgtk.so3conv.functional as L
-
+import ipdb
 import matplotlib.pyplot as plt
+#from .metrics.metrics import pose_log_norm, pose_Fro_norm, rotation_angle_error, map_err_ops_to_list
+#from .data_loader.modelnet40 import ModelNet40Alignment
 from mpl_toolkits.mplot3d import Axes3D
 def visualize_pointcloud(points, normals=None,
                          out_file=None, show=False, 
@@ -242,6 +245,7 @@ class Trainer(vgtk.Trainer):
             raise KeyError("Unrecognized representation of rotation: %s"%self.opt.model.representation)
 
         r_cls_loss = self.opt.train_loss.reg_r_cls_loss
+        print("rot_ref_tgt is ",self.opt.rot_ref_tgt, " top_k is ",self.opt.topk)
         self.metric = vgtk.MultiTaskDetectionLoss(anchors, rot_ref_tgt=self.opt.rot_ref_tgt, nr=out_channel, s2_mode=s2_mode, r_cls_loss=r_cls_loss, topk=self.opt.topk, logger=self.logger)#, writer=self.writer) #, w=50)    # tmp!!!!
 
     # For epoch-based training
@@ -290,8 +294,8 @@ class Trainer(vgtk.Trainer):
         preds, y = self.model(in_tensors)
         self.optimizer.zero_grad()
 
-        # TODO
-        self.loss, cls_loss, l2_loss, acc, error = self.metric(preds, in_rot_label, y, in_R, in_alignment, in_anchor_label)
+        # TODO/
+        self.loss, cls_loss, l2_loss, acc, error, _, _ = self.metric(preds, in_rot_label, y, in_R, in_alignment, in_anchor_label)
         self.loss.backward()
         self.optimizer.step()
 
@@ -331,7 +335,7 @@ class Trainer(vgtk.Trainer):
 
         with torch.no_grad():
             for it, data in enumerate(tqdm(self.dataset_test)):
-                in_tensors = data['pc'].to(self.opt.device)
+                in_tensors = data['pc'].to(self.opt.device) #torch.Size([8, 2, 1024, 3])
                 nb, _, npoint, _ = in_tensors.shape
                 # in_tensors = torch.cat([in_tensors[:,0], in_tensors[:,1]],dim=0)
                 in_rot_label = data['R_label'].to(self.opt.device).view(nb,-1)
@@ -341,10 +345,12 @@ class Trainer(vgtk.Trainer):
                     in_anchor_label = data['anchor_label'].to(self.opt.device)
                 else:
                     in_anchor_label = None
-
+                # pred shape:   torch.Size([8, 60, 12])
+                # y shape: torch.Size([8, 4])
                 preds, y = self.model(in_tensors)
+                #ipdb.set_trace()
                 # TODO
-                self.loss, cls_loss, l2_loss, acc, error = self.metric(preds, in_rot_label, y, in_R, in_alignment, in_anchor_label)
+                self.loss, cls_loss, l2_loss, acc, error, pred_R, gt_R = self.metric(preds, in_rot_label, y, in_R, in_alignment, in_anchor_label)
                 # all_labels.append(in_label.cpu().numpy())
                 # all_feats.append(feat.cpu().numpy())
                 all_acc.append(acc.cpu().numpy())
@@ -388,3 +394,136 @@ class Trainer(vgtk.Trainer):
         self.model.train()
         self.metric.train()
         return new_best
+
+    def metric_all(self):
+        pass
+    def eval_all(self):
+        self.logger.log('Testing','Evaluating test set!')
+        self.model.eval()
+        self.metric.eval()
+        torch.cuda.reset_peak_memory_stats()
+
+        all_error = []
+        all_acc = []
+
+        err_test = {
+            'log': {'op': pose_log_norm, 'init_err': [], 'pred_err': []},
+            'frobenius': {'op': pose_Fro_norm, 'init_err': [], 'pred_err': []},
+            'angle': {'op': rotation_angle_error, 'init_err': [], 'pred_err': []},
+            'pose_pair_list': [],
+            'ltype': pp.SO3_type
+        }
+
+        with torch.no_grad():
+            for it, data in enumerate(tqdm(self.dataset_test)):
+                
+                #in_tensors = data['pc'].to(self.opt.device) #torch.Size([8, 2, 1024, 3])
+                in_tensors = torch.cat((torch.unsqueeze(data['pc1'], 1),
+                                        torch.unsqueeze(data['pc2'], 1)), 1)
+                ipdb.set_trace()
+                nb, _, npoint, _ = in_tensors.shape
+                # in_tensors = torch.cat([in_tensors[:,0], in_tensors[:,1]],dim=0)
+                in_rot_label = data['R_label'].to(self.opt.device).view(nb,-1)
+                in_alignment = data['T'].to(self.opt.device).float()
+                in_R = data['R'].to(self.opt.device).float()
+                if 'anchor_label' in data:
+                    in_anchor_label = data['anchor_label'].to(self.opt.device)
+                else:
+                    in_anchor_label = None
+                # pred shape:   torch.Size([8, 60, 12])
+                # y shape: torch.Size([8, 4])
+                preds, y = self.model(in_tensors)
+                ipdb.set_trace()
+
+                self.loss, cls_loss, l2_loss, acc, error, pred, gt = self.metric(preds, in_rot_label, y, in_R, in_alignment, in_anchor_label)                
+                # TODO
+
+                for err_type in err_test:
+                    #ipdb.set_trace()
+                    if not isinstance(err_test[err_type], dict) or ('op' not in err_test[err_type]):
+                        continue
+                    #try:
+                    init_err = err_test[err_type]['op'](T_init_copy, Ts_tensor.cpu(), err_test['ltype'])
+                    #except TypeError as e:
+                    #    print("Exception {e}")
+                    #    ipdb.set_trace()
+                    pred_err = err_test[err_type]['op'](pred.cpu(), Ts_tensor.cpu(), err_test['ltype'])
+                    err_test[err_type]['init_err'].extend(init_err)
+                    err_test[err_type]['pred_err'].extend(pred_err)
+        
+                    err_test['pose_pair_list'].append({'T_init': T_init_copy,
+                                                       'T_pred': pred,
+                                                       'T_gt': Ts_tensor})
+                
+
+                # all_labels.append(in_label.cpu().numpy())
+                # all_feats.append(feat.cpu().numpy())
+                all_acc.append(acc.cpu().numpy())
+                all_error.append(error.cpu().numpy())
+                # self.logger.log("Testing", "Accuracy: %.1f, error: %.2f!"%(100*acc.item(), error.mean().item()))
+
+            # import ipdb; ipdb.set_trace()
+            all_error = np.concatenate(all_error, 0)
+            all_acc = np.array(all_acc, dtype=np.float32)
+
+            var_error = np.var(all_error)
+            std_error = np.std(all_error)
+            mean_error = np.mean(all_error) * 180 / np.pi
+            mean_acc = 100 * all_acc.mean()
+            self.test_accs.append(mean_error)
+            new_best = self.best_acc is None or mean_error < self.best_acc
+            if new_best:
+                self.best_acc = mean_error
+
+            self.logger.log('Testing', 'Average classifier acc is %.2f!!!!'%(mean_acc))
+            self.logger.log('Testing', 'Median angular error is %.2f degree!!!!'%(np.median(all_error) * 180 / np.pi))
+            self.logger.log('Testing', 'Mean angular error is %.2f degree!!!!'%(mean_error))
+            self.logger.log('Testing', 'Max angular error is %.2f degree!!!!'%(np.amax(all_error) * 180 / np.pi))
+            self.logger.log('Testing', 'Error variance is %.3f degree^2!!!!'%(var_error))
+            self.logger.log('Testing', 'Error std is %.3f degree!!!!'%(std_error))
+            
+            self.logger.log('Testing', 'Best mean angular error so far is %.2f degree!!!!'%(self.best_acc))
+            
+            mem_used_max_GB = torch.cuda.max_memory_allocated() / (1024*1024*1024)
+            torch.cuda.reset_peak_memory_stats()
+            self.logger.log('Testing', f'Mem: {mem_used_max_GB:.3f}GB')
+
+
+            err_dict = {
+                'Frobenius Norm Error': torch.mean(torch.tensor(err_test['frobenius']['pred_err'])),
+                'Matrix Log Norm Error': torch.mean(torch.tensor(err_test['log']['pred_err'])),
+                'Rotation Angle Error': torch.mean(torch.tensor(err_test['angle']['pred_err'])),
+                'Translation Norm Error': torch.mean(torch.tensor(err_test['translation_norm']['pred_err'])) if opt.net_args.is_se3 else float('nan')
+            }
+            init_err_dict = {
+                'Frobenius Norm Error': torch.mean(torch.tensor(err_test['frobenius']['init_err'])),
+                'Matrix Log Norm Error': torch.mean(torch.tensor(err_test['log']['init_err'])),
+                'Rotation Angle Error': torch.mean(torch.tensor(err_test['angle']['init_err'])),
+                'Translation Norm Error': torch.mean(torch.tensor(err_test['translation_norm']['init_err'])) if opt.net_args.is_se3 else float('nan')
+            }
+
+            
+            
+            log_string('Init result of %d data: Test Err : f-norm is %f, log-norm is %f, angle-err is %f, translation-err is %f'% (len(err_test['frobenius']['pred_err']),
+                                                                                                                                   init_err_dict['Frobenius Norm Error'], init_err_dict['Matrix Log Norm Error'],
+                                                                                                                                   init_err_dict['Rotation Angle Error'], init_err_dict['Translation Norm Error']
+                                                                                                                                   ))
+
+            log_string('Test result of %d data: Test Err : f-norm is %f, log-norm is %f, angle-err is %f, translation-err is %f'% (len(err_test['frobenius']['pred_err']),
+                                                                                                                                   err_dict['Frobenius Norm Error'], err_dict['Matrix Log Norm Error'],
+                                                                                                                                   err_dict['Rotation Angle Error'], err_dict['Translation Norm Error']
+                                                                                                                                   ))
+            
+            
+            if self.exp_name is not None:
+                save_path = os.path.join(self.root_dir, 'data','alignment_errors', f'{self.exp_name}_error.txt')
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                np.savetxt(save_path,all_error)
+            # import ipdb; ipdb.set_trace()
+
+            # self.logger.log('Testing', 'Best accuracy so far is %.2f!!!!'%(best_acc))
+
+        self.model.train()
+        self.metric.train()
+        return new_best
+    

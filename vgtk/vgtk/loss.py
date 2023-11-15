@@ -300,7 +300,7 @@ class MultiTaskDetectionLoss(torch.nn.Module):
 
         ### total loss, binary classification loss on anchors, l2 loss on residual rotation matrix, 
         ### accuracy of rotation classification, angular error of rotation prediction
-        return loss, cls_loss, self.w * l2_loss, r_acc, mean_angular_error(pred_R, true_R)
+        return loss, cls_loss, self.w * l2_loss, r_acc, mean_angular_error(pred_R, true_R), pred_R, true_R
 
     def forward(self, wts, label, y, gt_R, gt_T=None, anchor_label=None):
         ''' setting for alignment regression:
@@ -413,7 +413,7 @@ class MultiTaskDetectionLoss(torch.nn.Module):
 
         ### total loss, cross entropy loss on rotations, l2 loss on residual rotation matrix, 
         ### accuracy of rotation classification, angular error of rotation prediction
-        return loss, cls_loss, self.w * l2_loss, r_acc, mean_angular_error(pred_R, true_R)
+        return loss, cls_loss, self.w * l2_loss, r_acc, mean_angular_error(pred_R, true_R), pred_R, true_R
 
 def angle_from_R(R):
     return acos_safe(0.5 * (torch.einsum('bii->b',R) - 1))

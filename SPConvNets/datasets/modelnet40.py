@@ -7,6 +7,8 @@ import torch
 import torch.utils.data as data
 import vgtk.pc as pctk
 import vgtk.point3d as p3dtk
+from . import vgtk_utils
+from . import gmm_noise
 import vgtk.so3conv.functional as L
 from vgtk.functional import rotation_distance_np, label_relative_rotation_np, label_relative_rotation_simple
 from scipy.spatial.transform import Rotation as sciR
@@ -15,6 +17,35 @@ import matplotlib.pyplot as plt
 import point_cloud_utils as pcu
 import math
 import time
+import open3d as o3d 
+def gen_pc_normals(pc_src):
+    pc_src_o3d = o3d.geometry.PointCloud()
+    pc_src_o3d.points = o3d.utility.Vector3dVector(pc_src)
+    pc_src_o3d.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
+    pc_src_o3d.normalize_normals()
+    normals_src = np.asarray(pc_src_o3d.normals)
+    return normals_src
+
+
+def crop_2d_array(pc_in, crop_ratio):
+
+    ind_src = np.random.randint(pc_in.shape[1])
+    selected_col = pc_in[:, ind_src]
+    ind_order = np.argsort(selected_col)
+    sorted_pc = pc_in[ind_order, :]
+
+    head_or_tail = np.random.randint(2)
+    
+    if head_or_tail:
+        crop_ratio = max(crop_ratio, 1-crop_ratio)
+        sorted_pc = np.split(sorted_pc, [int(crop_ratio*sorted_pc.shape[0])], axis=0)[0]
+    else:
+        crop_ratio = min(crop_ratio, 1-crop_ratio)
+        sorted_pc = np.split(sorted_pc, [int(crop_ratio*sorted_pc.shape[0])], axis=0)[1]
+
+    return sorted_pc
+
+
 
 def gaussian(x, mu, sig):
     return np.exp(-np.power(x - mu, 2.) / (2 * np.power(sig, 2.)))
@@ -486,17 +517,46 @@ class Dataloader_ModelNet40Alignment(data.Dataset):
         else:
             self.anchors = L.get_anchors(self.opt.model.kanchor)
 
+        self.max_rotation_degree = opt.max_rotation_degree #45.0
+        self.noise_augmentation = 0.01
+        self.outlier_augmentation = 0.0
+        if not math.isclose(self.noise_augmentation, 0):
+            self.gmm_sample = gmm_noise.GmmSample(1-self.outlier_augmentation, 0.01,
+                                                  self.noise_augmentation, self.opt.model.input_num)
+        
+        self.crop_ratio = self.opt.crop_ratio
+
+        self.airplane_only = opt.modelnet_airplane_only        
+        self.half_categories = opt.modelnet_half_categories
+        if self.airplane_only:
+            cats = ['airplane']
+            print(f"[Dataloader]: USING ONLY THE {cats[0]} CATEGORY!!")
+        elif self.half_categories:
+            if self.mode == 'train':
+                cats = ['airplane', 'bed', 'bookshelf', 'bowl', 'chair', 'cup', 'desk', 'dresser', 'glass_box', 'keyboard', 'laptop', 'monitor', 'person', 'plant', 'range_hood', 'sofa', 'stool',
+                       'tent', 'tv_stand', 'wardrobe']
+            else:
+                cats = ['bathtub', 'bench', 'bottle', 'car', 'cone', 'curtain', 'door', 'flower_pot', 'guitar', 'lamp', 'mantel', 'night_stand', 'piano', 'radio', 'sink', 'stairs', 'table','toilet', 'vase', 'xbox' ]
+        else:
+            cats = os.listdir(opt.dataset_path)
+        for cat in cats:
+            print("[Dataloader]: USING THE {} CATEGORY!!".format(cat))
+        
         # if self.flag == 'rotation':
         #     cats = ['airplane']
         #     print(f"[Dataloader]: USING ONLY THE {cats[0]} CATEGORY!!")
         # else:
         #     cats = os.listdir(opt.dataset_path)
-
-        cats = ['airplane']
+        #cats = os.listdir(opt.dataset_path)
+        #cats = ['airplane']
+        #cats = ['airplane', 'bed', 'bookshelf', 'bowl', 'chair', 'cup', 'desk', 'dresser', 'glass_box', 'keyboard', 'laptop', 'monitor', 'person', 'plant', 'range_hood', 'sofa', 'stool', \
+        #       'tent', 'tv_stand', 'wardrobe']
+        #cats = ['bathtub', 'bench', 'bottle', 'car', 'cone', 'curtain', 'door', 'flower_pot', 'guitar', 'lamp', 'mantel', 'night_stand', 'piano', 'radio', 'sink', 'stairs', 'table','toilet', 'vase', 'xbox' ]
         # cats = ['chair']
         # cats = ['airplane','chair','car']
         print(f"[Dataloader]: USING ONLY THE {cats} CATEGORY!!")
         # print(f"[Dataloader]: USING ONLY THE {cats[0]} CATEGORY!!")
+
 
         self.dataset_path = opt.dataset_path
         self.all_data = []
@@ -509,18 +569,60 @@ class Dataloader_ModelNet40Alignment(data.Dataset):
                 self.all_data.append(fn)
         print("[Dataloader] : Training dataset size:", len(self.all_data))
 
+        
+
 
     def __len__(self):
         return len(self.all_data)
 
     def __getitem__(self, index):
         data = sio.loadmat(self.all_data[index])
-        _, pc = pctk.uniform_resample_np(data['pc'], self.opt.model.input_num)  # data['pc']: 1.1k-3k
+        name = data['name'][0]
+        if not math.isclose(self.crop_ratio, 0):
+
+            data = vgtk_utils.normalize_np(data['pc'].T)
+            data = data.T
+            data_tgt = data
+            
+            data_src, R_src = vgtk_utils.rotate_point_cloud(data, max_degree = self.max_rotation_degree)
+            
+            data_src = crop_2d_array(data_src, self.crop_ratio)
+            data_tgt = crop_2d_array(data_tgt, self.crop_ratio)
+
+            _, pc_src = vgtk_utils.uniform_resample_np(data_src, self.opt.model.input_num)  # data['pc']: 1.1k-3k
+            _, pc_tgt = vgtk_utils.uniform_resample_np(data_tgt, self.opt.model.input_num)  # data['pc']: 1.1k-3k
+
+        else:
+        
+            _, pc = vgtk_utils.uniform_resample_np(data['pc'], self.opt.model.input_num)  # data['pc']: 1.1k-3k
+            
+            # normalization
+            pc = vgtk_utils.normalize_np(pc.T)
+            pc = pc.T
+            pc_tgt = pc                
+            # R = np.eye(3)
+            # R_label = 29
+            
+            # source shape
+            # if 'R' in data.keys() and self.mode != 'train':
+            #     pc_src, R_src = pctk.rotate_point_cloud(pc, data['R'])
+            # else:
+            #     pc_src, R_src = pctk.rotate_point_cloud(pc)
+            
+            ### pc_src.T = R_src * pc.T (3*N)
+            if self.opt.debug_mode == 'check_equiv':
+                i = np.random.randint(60)
+                #pc_src, R_src = rotate_point_cloud(pc_tgt, self.anchors[i])    # tmp!!!!
+                pc_src, R_src = pctk.rotate_point_cloud(pc, self.anchors[i])    # tmp!!!!                
+            else:
+                pc_src, R_src = vgtk_utils.rotate_point_cloud(pc_tgt, max_degree = self.max_rotation_degree)
+        
+        #_, pc = pctk.uniform_resample_np(data['pc'], self.opt.model.input_num)  # data['pc']: 1.1k-3k
 
         # normalization
-        pc = p3dtk.normalize_np(pc.T)
-        pc = pc.T
-
+        #pc = p3dtk.normalize_np(pc.T)
+        #pc = pc.T
+        #pc_tgt = pc
         # R = np.eye(3)
         # R_label = 29
 
@@ -531,17 +633,19 @@ class Dataloader_ModelNet40Alignment(data.Dataset):
         #     pc_src, R_src = pctk.rotate_point_cloud(pc)
 
         ### pc_src.T = R_src * pc.T (3*N)
-        if self.opt.debug_mode == 'check_equiv':
-            i = np.random.randint(60)
-            pc_src, R_src = pctk.rotate_point_cloud(pc, self.anchors[i])    # tmp!!!!
-        else:
-            pc_src, R_src = pctk.rotate_point_cloud(pc)
+        #if self.opt.debug_mode == 'check_equiv':
+        #    i = np.random.randint(60)
+        #    pc_src, R_src = pctk.rotate_point_cloud(pc, self.anchors[i])    # tmp!!!!
+        #else:
+        #    #pc_src, R_src = pctk.rotate_point_cloud(pc)
+        #    pc_src, R_src = vgtk_utils.rotate_point_cloud(pc, max_degree = self.max_rotation_degree)
+            
         ### notice that the seed of the Trainer is given, thus the sampling is deterministic
 
         # target shape
 
         # pc_tgt, R_tgt = pctk.rotate_point_cloud(pc)
-        pc_tgt = pc
+
 
         # if self.mode == 'test':
         #     data['R'] = R
@@ -552,6 +656,11 @@ class Dataloader_ModelNet40Alignment(data.Dataset):
 
         # T = R_src @ R_tgt.T
         T = R_src # @ R_tgt.T
+
+        if not math.isclose(0.0, self.noise_augmentation):
+            pc_src = self.gmm_sample.sample(pc_src, gen_pc_normals(pc_src))
+            pc_tgt = self.gmm_sample.sample(pc_tgt, gen_pc_normals(pc_tgt))
+        
 
         # RR_regress = np.einsum('abc,bj,ijk -> aick', self.anchors, T, self.anchors)
         # R_label = np.argmax(np.einsum('abii->ab', RR_regress),axis=1)
@@ -571,7 +680,7 @@ class Dataloader_ModelNet40Alignment(data.Dataset):
         pc_tensor = np.stack([pc_src, pc_tgt])
 
         in_dict =  {'pc':torch.from_numpy(pc_tensor.astype(np.float32)),
-                'fn': data['name'][0],
+                'fn': name,
                 'T' : torch.from_numpy(T.astype(np.float32)),
                 'R': torch.from_numpy(R.astype(np.float32)),
                 'R_label': torch.Tensor(np.array([R_label])).long(),
